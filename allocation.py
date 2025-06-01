@@ -84,7 +84,7 @@ county_homes = {
     for county, cdata in county_data.items()
 }
 
-# --- Step 5: Allocate homes within each county by risk tier ---
+# --- Step 4: Allocate homes within each county by risk tier ---
 allocations = []
 for county, total_h in county_homes.items():
     risks = county_data[county]

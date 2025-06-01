@@ -176,28 +176,93 @@ home_to_insurer = {}
 remaining_homes = homes_df.copy()
 
 for county in counties:
+    # first make sure that they get proportional to market share, with rounding caveat
     county_homes = remaining_homes[remaining_homes["County"] == county]
     n_county_homes = len(county_homes)
     insurer_allocations = (scaled_weights * n_county_homes).astype(int)
-
     while insurer_allocations.sum() < n_county_homes:
         insurer_allocations[np.argmin(insurer_allocations)] += 1
 
     county_remaining = county_homes.copy()
     buckets = {ins: [] for ins in insurers}
 
-    # Greedy allocation by expected loss per bucket
-    for i, insurer in enumerate(insurers):
-        n = insurer_allocations[i]
-        selection = county_remaining.head(n)
-        buckets[insurer] = selection["HomeID"].tolist()
-        county_remaining = county_remaining[~county_remaining["HomeID"].isin(selection["HomeID"])]
+    from itertools import cycle
 
-    for insurer, home_ids in buckets.items():
-        for hid in home_ids:
-            home_to_insurer[hid] = insurer
+    county_remaining = county_remaining.sample(frac=1, random_state=42)  # Shuffle first
+    # Sort by expected loss (highest risk first)
+    county_remaining = county_remaining.sort_values("ExpectedLoss", ascending=False).copy()
+    home_ids = county_remaining["HomeID"].tolist()
 
+    # Initialize buckets and loss trackers
+    buckets = {ins: [] for ins in insurers}
+    remaining_quota = dict(zip(insurers, insurer_allocations))
+    total_loss = {ins: 0 for ins in insurers}
+
+    # Sort homes by expected loss descending (high-risk first)
+    county_remaining = county_remaining.sample(frac=1, random_state=42)
+    county_remaining = county_remaining.sort_values("ExpectedLoss", ascending=False).copy()
+
+    # Loop through each home
+    for _, row in county_remaining.iterrows():
+        hid = row["HomeID"]
+        loss = row["ExpectedLoss"]
+
+        # Find the eligible insurer with the lowest total expected loss
+        eligible = [ins for ins in insurers if remaining_quota[ins] > 0]
+        best = min(eligible, key=lambda ins: total_loss[ins] / (len(buckets[ins]) + 1e-6))
+
+        # Assign home
+        buckets[best].append(hid)
+        total_loss[best] += loss
+        remaining_quota[best] -= 1
+
+for insurer, home_ids in buckets.items():
+    for hid in home_ids:
+        home_to_insurer[hid] = insurer
 homes_df["Insurer"] = homes_df["HomeID"].map(home_to_insurer)
+
+# Rebalance average expected loss per insurer via pairwise home swaps
+
+tolerance = 100
+max_iterations = 1000
+iteration = 0
+
+while iteration < max_iterations:
+    # Compute average expected loss per insurer
+    avg_loss = homes_df.groupby("Insurer")["ExpectedLoss"].mean()
+    high = avg_loss.idxmax()
+    low = avg_loss.idxmin()
+    diff = avg_loss[high] - avg_loss[low]
+
+    if diff <= tolerance:
+        print(f"\n✅ Balanced within {tolerance} after {iteration} iterations.")
+        break
+
+    # Get the riskiest home from the overburdened insurer
+    high_home = homes_df[homes_df["Insurer"] == high]\
+        .sort_values("ExpectedLoss", ascending=False).iloc[0]
+    low_home = homes_df[homes_df["Insurer"] == low]\
+        .sort_values("ExpectedLoss", ascending=True).iloc[0]
+
+    high_id = high_home["HomeID"]
+    low_id = low_home["HomeID"]
+
+    # Only swap if homes are distinct and beneficial
+    if high_id == low_id or high_home["ExpectedLoss"] <= low_home["ExpectedLoss"]:
+        print("⛔ No beneficial swap found. Exiting.")
+        break
+
+    # 🛠 Use TEMP placeholder to prevent overwrite
+    homes_df.loc[homes_df["HomeID"] == high_id, "Insurer"] = "TEMP"
+    homes_df.loc[homes_df["HomeID"] == low_id, "Insurer"] = high
+    homes_df.loc[homes_df["HomeID"] == high_id]()
+
+import matplotlib.pyplot as plt
+
+homes_df.groupby("Insurer")["ExpectedLoss"].mean().plot(kind="bar")
+plt.ylabel("Avg Expected Loss per Home")
+plt.title("Expected Loss by Insurer")
+plt.show()
 
 # (4) Summary Table + Export to Excel
 
