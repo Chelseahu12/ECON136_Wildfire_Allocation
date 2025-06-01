@@ -1,10 +1,10 @@
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 
 np.random.seed(42)
 
-# (1) Import data
-
+# (1) Use real county data and compute homes
 counties = [
     "Alameda", "Alpine", "Amador", "Butte", "Calaveras", "Colusa", "Contra Costa", "Del Norte", "El Dorado",
     "Fresno", "Glenn", "Humboldt", "Imperial", "Inyo", "Kern", "Kings", "Lake", "Lassen", "Los Angeles",
@@ -72,8 +72,7 @@ county_acreage_distribution = {
     "Ventura": {"Moderate": 12370, "High": 17583, "Very High": 88810},
     "Yolo": {"Moderate": 3488, "High": 34041, "Very High": 1114},
     "Yuba": {"Moderate": 15611, "High": 1592, "Very High": 0}
-    }
-
+}
 county_property_values = {
     "Alameda": 1105150,
     "Alpine": 484530,
@@ -132,28 +131,27 @@ county_property_values = {
     "Tuolumne": 422260,
     "Ventura": 845370,
     "Yolo": 629450,
-    "Yuba": 396890
-}
+    "Yuba": 396890}
 
 burn_prob_ranges = {
     "Very High": (0.01, 0.02),
     "High": (0.005, 0.01),
     "Moderate": (0.0005, 0.005)
 }
-total_homes = 10000
 
-# Insurers
+total_homes = 10000
 insurers = ["A", "B", "C", "D", "E", "F", "G", "H"]
 scaled_shares = [28.06, 21.00, 9.17, 9.17, 8.60, 8.18, 8.18, 7.63]
 scaled_weights = np.array(scaled_shares) / sum(scaled_shares)
 
-# (2) Convert Acreage to Homes, to Property Value
-
+# (2) Create all homes
 all_homes = []
 home_id = 1
 total_acreage = sum(sum(risks.values()) for risks in county_acreage_distribution.values())
 
 for county in counties:
+    if county not in county_acreage_distribution or county not in county_property_values:
+        continue
     county_risks = county_acreage_distribution[county]
     mean_value = county_property_values[county]
     county_total_acreage = sum(county_risks.values())
@@ -170,65 +168,81 @@ for county in counties:
 
 homes_df = pd.DataFrame(all_homes, columns=["HomeID", "County", "RiskLevel", "BurnProb", "PropValue", "ExpectedLoss"])
 
-# (3) Allocate to Insurers Based on Market Share and Equal Expected Loss (Per County)
+# (3) Randomly assign homes per county based on market share
+assignment_rows = []
+for county in homes_df["County"].unique():
+    county_df = homes_df[homes_df["County"] == county].sample(frac=1, random_state=42)
+    n_county_homes = len(county_df)
+    allocations = (scaled_weights * n_county_homes).astype(int)
+    while allocations.sum() < n_county_homes:
+        allocations[np.argmin(allocations)] += 1
+    idx = 0
+    for insurer, n in zip(insurers, allocations):
+        assigned = county_df.iloc[idx:idx+n].copy()
+        assigned["Insurer"] = insurer
+        assignment_rows.append(assigned)
+        idx += n
 
-home_to_insurer = {}
-remaining_homes = homes_df.copy()
+homes_df = pd.concat(assignment_rows).reset_index(drop=True)
 
-for county in counties:
-    county_homes = remaining_homes[remaining_homes["County"] == county]
-    n_county_homes = len(county_homes)
-    insurer_allocations = (scaled_weights * n_county_homes).astype(int)
+# (4) Post-processing rebalance
+max_iterations = 1000
+iteration = 0
+tolerance = 100
+while iteration < max_iterations:
+    avg_loss = homes_df.groupby("Insurer")["ExpectedLoss"].mean()
+    high = avg_loss.idxmax()
+    low = avg_loss.idxmin()
+    diff = avg_loss[high] - avg_loss[low]
+    if diff <= tolerance:
+        print(f"\n✅ Balanced within {tolerance} after {iteration} iterations.")
+        break
 
-    while insurer_allocations.sum() < n_county_homes:
-        insurer_allocations[np.argmin(insurer_allocations)] += 1
+    high_home = homes_df[homes_df["Insurer"] == high].sort_values("ExpectedLoss", ascending=False).iloc[0]
+    low_home = homes_df[homes_df["Insurer"] == low].sort_values("ExpectedLoss", ascending=True).iloc[0]
+    high_id = high_home["HomeID"]
+    low_id = low_home["HomeID"]
+    if high_id == low_id or high_home["ExpectedLoss"] <= low_home["ExpectedLoss"]:
+        print("⛔ No beneficial swap found. Exiting.")
+        break
+    homes_df.loc[homes_df["HomeID"] == high_id, "Insurer"] = "TEMP"
+    homes_df.loc[homes_df["HomeID"] == low_id, "Insurer"] = high
+    homes_df.loc[homes_df["HomeID"] == high_id, "Insurer"] = low
+    iteration += 1
 
-    county_remaining = county_homes.copy()
-    buckets = {ins: [] for ins in insurers}
+# (5) Visualization
+homes_df.groupby("Insurer")["ExpectedLoss"].mean().plot(kind="bar")
+plt.ylabel("Avg Expected Loss Per Home")
+plt.title("Expected Loss Per Home by Insurer")
+plt.show()
 
-    # Greedy allocation by expected loss per bucket
-    for i, insurer in enumerate(insurers):
-        n = insurer_allocations[i]
-        selection = county_remaining.head(n)
-        buckets[insurer] = selection["HomeID"].tolist()
-        county_remaining = county_remaining[~county_remaining["HomeID"].isin(selection["HomeID"])]
-
-    for insurer, home_ids in buckets.items():
-        for hid in home_ids:
-            home_to_insurer[hid] = insurer
-
-homes_df["Insurer"] = homes_df["HomeID"].map(home_to_insurer)
-
-# (4) Summary Table + Export to Excel
-
-allocation_summary = homes_df.groupby(["County", "RiskLevel", "Insurer"]).size().reset_index(name="NumHomes")
+# (6) Export to Excel
 homes_df.to_excel("homes_data.xlsx", index=False)
+allocation_summary = homes_df.groupby(["County", "RiskLevel", "Insurer"]).size().reset_index(name="NumHomes")
 allocation_summary.to_excel("allocation_summary.xlsx", index=False)
 
-# (5) Lookup Function
-
+# (7) Lookup functions
 home_insurer_lookup = homes_df.set_index("HomeID")["Insurer"].to_dict()
 def get_insurer(home_id):
     return home_insurer_lookup.get(home_id, "Home ID not found")
 
-# (6) Native Home Lookup
-
 def home_lookup(home_id):
     try:
         row = homes_df.loc[homes_df["HomeID"] == home_id].iloc[0]
-        print(f"🏠 Home ID: {home_id}")
-        print(f"📍 County: {row['County']}")
-        print(f"⚠️  Risk Level: {row['RiskLevel']}")
-        print(f"🔥 Burn Probability: {row['BurnProb']:.4f}")
-        print(f"💰 Property Value: ${row['PropValue']:,.2f}")
-        print(f"💸 Expected Loss: ${row['ExpectedLoss']:,.2f}")
-        print(f"🏢 Insurance Company: {row['Insurer']}")
+        print(f"Home ID: {home_id}")
+        print(f"County: {row['County']}")
+        print(f"Risk Level: {row['RiskLevel']}")
+        print(f"Burn Probability: {row['BurnProb']:.4f}")
+        print(f"Property Value: ${row['PropValue']:,.2f}")
+        print(f"Expected Loss: ${row['ExpectedLoss']:,.2f}")
+        print(f"Insurance Company: {row['Insurer']}")
     except IndexError:
-        print("❌ Home ID not found. Please enter a valid ID between 1 and 10,000.")
+        print("Home ID not found. Please enter a valid ID.")
 
+# (8) Interactive prompt
 while True:
     try:
-        user_input = input("Enter a Home ID (1–10000), or 'q' to quit: ")
+        user_input = input("Enter a Home ID (or 'q' to quit): ")
         if user_input.lower() == 'q':
             break
         home_id = int(user_input)
